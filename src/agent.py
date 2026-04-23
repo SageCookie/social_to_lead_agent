@@ -33,11 +33,24 @@ llm = ChatGoogleGenerativeAI(model=model_name, temperature=0)
 # --- 3. Node Functions ---
 
 def intent_classifier(state: AgentState):
-    """Identifies if the user is greeting, inquiring, or showing high-intent [cite: 20-23]."""
+    """Accurately identifies user intent with support for list-based content blocks."""
     last_msg = state["messages"][-1].content
     prompt = f"Classify intent: '{last_msg}'. Options: 'greeting', 'inquiry', 'lead'. Return ONLY the word."
     response = llm.invoke([HumanMessage(content=prompt)])
-    return {"intent": response.content.strip().lower()}
+    
+    # 2026 SDK Fix: Handle content whether it's a string or a list of blocks
+    content = response.content
+    if isinstance(content, list):
+        # Join all text blocks together
+        content = "".join([c if isinstance(c, str) else c.get("text", "") for c in content])
+    
+    return {"intent": str(content).strip().lower()}
+
+def get_clean_text(response):
+    """Helper to strip metadata and signatures from 2026 model outputs."""
+    if isinstance(response.content, list):
+        return "".join([p.get("text", "") for p in response.content if isinstance(p, dict) and "text" in p])
+    return response.content
 
 def greeting_node(state: AgentState):
     """Handles casual greetings[cite: 21, 58]."""
@@ -59,38 +72,55 @@ def rag_node(state: AgentState):
     return {"messages": [AIMessage(content=response.content)]}
 
 def lead_capture_node(state: AgentState):
-    """Collects Name, Email, and Platform before triggering the mock tool [cite: 45-51, 112]."""
+    """Collects Name, Email, and Platform."""
     info = state.get("user_info", {"name": None, "email": None, "platform": None})
-    last_msg = state["messages"][-1].content
     
-    # Logic to extract details from the current message
+    # --- 2026 FIX: Robust Content Extraction ---
+    last_msg = state["messages"][-1].content
+    if isinstance(last_msg, list):
+        last_msg = "".join([p.get("text", "") for p in last_msg if isinstance(p, dict) and "text" in p])
+    
+    # Combine System Instructions + Human Message to avoid 'contents are required' error
     extraction_prompt = f"""
-    Current info: {info}
-    Extract Name, Email, and Creator Platform from the user message: "{last_msg}"
-    Return as a JSON object. If a value is unknown, keep it as null.
+    SYSTEM: You are a data extraction bot.
+    CURRENT DATA: {info}
+    USER MESSAGE: "{last_msg}"
+    
+    TASK: Extract Name, Email, and Creator Platform. 
+    Return ONLY a JSON object. If a value is missing, use null.
     """
-    response = llm.invoke([SystemMessage(content=extraction_prompt)])
+    
+    # We use HumanMessage here to satisfy the API's requirement for 'user' content
+    response = llm.invoke([HumanMessage(content=extraction_prompt)])
+    
+    # Clean the response (handling the 2026 metadata blocks)
+    res_content = response.content
+    if isinstance(res_content, list):
+        res_content = "".join([p.get("text", "") for p in res_content if isinstance(p, dict) and "text" in p])
+    
     try:
-        extracted = json.loads(response.content)
-        # Update state with newly extracted info
+        # Simple extraction logic
+        import json
+        # Strip potential markdown code blocks if the model adds them
+        json_str = res_content.replace("```json", "").replace("```", "").strip()
+        extracted = json.loads(json_str)
         for key in info:
             if extracted.get(key):
                 info[key] = extracted[key]
     except:
-        pass # Fallback if model doesn't return clean JSON
+        pass # Fallback if extraction fails
     
-    # Ensure tool is not triggered prematurely [cite: 55, 73]
-    if not info["name"]:
+    # --- 4. Logic to ask for missing info ---
+    if not info.get("name"):
         return {"messages": [AIMessage(content="I'd love to help you with that! What's your name?")], "user_info": info}
-    if not info["email"]:
-        return {"messages": [AIMessage(content=f"Nice to meet you, {info['name']}! What's your email address?")], "user_info": info}
-    if not info["platform"]:
-        return {"messages": [AIMessage(content="And which creator platform do you primarily use (YouTube, Instagram, etc.)?")], "user_info": info}
+    if not info.get("email"):
+        return {"messages": [AIMessage(content=f"Thanks, {info['name']}! And your email address?")], "user_info": info}
+    if not info.get("platform"):
+        return {"messages": [AIMessage(content="Almost there! Which platform do you use (YouTube or Instagram)?")], "user_info": info}
     
-    # Final step: Tool Execution [cite: 51, 71, 113, 119]
+    # --- 5. Final Tool Trigger ---
     mock_lead_capture(info['name'], info['email'], info['platform'])
-    return {"messages": [AIMessage(content="Perfect! Your details have been captured. An AutoStream expert will reach out soon.")], "user_info": info}
-
+    return {"messages": [AIMessage(content="Perfect! Your details are captured. We'll be in touch!")], "user_info": info}
 # --- 4. Build the Graph ---
 workflow = StateGraph(AgentState)
 
